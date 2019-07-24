@@ -1,6 +1,8 @@
 from datetime import datetime
 from operator import itemgetter
 
+from logzero import logger
+
 from django.db import transaction
 from django.http import Http404
 
@@ -44,9 +46,13 @@ class Import(APIView):
             return str(serializer.__class__)[32:-12]  # <class 'product_api.serializers.ProductSerializer'>  ->   Product
 
         def log_import():
-            print(10*'-', datetime.now().strftime('%Y.%m.%d %H:%M:%S'), 10*'-', 'inserted: %s, updated %s' % (inserted, updated), 10*'-', 'errors:' if errors else '')
-            for err in errors:
-                print(err)
+            msg = 'import - inserted %s, updated %s'
+            if errors:
+                logger.error(msg % (inserted, updated) + ' - errors (!)')
+                for err in errors:
+                    logger.warning(err)
+            else:
+                logger.info(msg % (inserted, updated))
 
         data = request.data
         if type(data) not in (list, tuple):
