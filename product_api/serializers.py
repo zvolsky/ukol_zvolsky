@@ -1,49 +1,67 @@
 from rest_framework import serializers
 
+from . import models
 
-class AttributeNameSerializer(serializers.ModelSerializer):
+
+class AbstractSerializer(serializers.ModelSerializer):
+    list_fields = ['id']
+
+    def __init__(self, *args, **kwargs):
+        as_list = kwargs.pop('as_list', False)
+        super().__init__(*args, **kwargs)
+        if as_list:
+            # self.fields = self.list_fields : not possible to do, because self.fields has more info inside
+            exclude = []
+            for fld in self.fields:
+                if fld not in self.list_fields:
+                    exclude.append(fld)  # to be sure, we avoid deletion during the cycle over same dict ..
+            for fld in exclude:          # .. and do it in separate step
+                del self.fields[fld]
+
+
+class AttributeNameSerializer(AbstractSerializer):
     class Meta:
-        model = AttributeName
+        model = models.AttributeName
         fields = ['id', 'nazev', 'kod', 'zobrazit']
 
 
-class AttributeValueSerializer(serializers.ModelSerializer):
+class AttributeValueSerializer(AbstractSerializer):
     class Meta:
-        model = AttributeValue
+        model = models.AttributeValue
         fields = ['id', 'hodnota']
 
 
-class AttributeSerializer(serializers.ModelSerializer):
+class AttributeSerializer(AbstractSerializer):
     class Meta:
-        model = Attribute
+        model = models.Attribute
         fields = ['id', 'nazev_atributu_id', 'hodnota_atributu_id']
 
 
-class ProductSerializer(serializers.ModelSerializer):
+class ProductSerializer(AbstractSerializer):
     class Meta:
-        model = Product
+        model = models.Product
         fields = ['id', 'nazev', 'description', 'cena', 'mena', 'published_on', 'is_published']
 
 
-class ProductAttributesSerializer(serializers.ModelSerializer):
+class ProductAttributesSerializer(AbstractSerializer):
     class Meta:
-        model = ProductAttributes
+        model = models.ProductAttributes
         fields = ['id', 'attribute', 'product']
 
 
-class ImageSerializer(serializers.ModelSerializer):
+class ImageSerializer(AbstractSerializer):
     class Meta:
-        model = Image
+        model = models.Image
         fields = ['id', 'nazev', 'obrazek']
 
 
-class ProductImageSerializer(serializers.ModelSerializer):
+class ProductImageSerializer(AbstractSerializer):
     class Meta:
-        model = ProductImage
+        model = models.ProductImage
         fields = ['id', 'product', 'obrazek_id', 'nazev']
 
 
-class CatalogSerializer(serializers.ModelSerializer):
+class CatalogSerializer(AbstractSerializer):
     class Meta:
-        model = Catalog
+        model = models.Catalog
         fields = ['id', 'nazev', 'obrazek_id', 'products_ids', 'attributes_ids']
