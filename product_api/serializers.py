@@ -4,6 +4,7 @@ from . import models
 
 
 class AbstractSerializer(serializers.ModelSerializer):
+    # id = serializers.IntegerField()
     list_fields = ['id']
 
     def __init__(self, *args, **kwargs):

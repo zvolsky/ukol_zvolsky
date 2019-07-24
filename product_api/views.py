@@ -1,4 +1,5 @@
-import json
+from datetime import datetime
+from operator import itemgetter
 
 from django.db import transaction
 from django.http import Http404
@@ -10,16 +11,21 @@ from rest_framework.views import APIView
 
 from . import models, serializers
 
+FAILURE_STOP = False   # with first error stop update the database but preserve previous changes
+FAILURE_REVERT = True  # with first error revert all changes
+
+FAILURE_MODE = FAILURE_REVERT  # FAILURE_STOP or FAILURE_REVERT
+
 
 MODELSWITCH = {
-    'attributename': (models.AttributeName, serializers.AttributeNameSerializer),
-    'attributevalue': (models.AttributeValue, serializers.AttributeValueSerializer),
-    'attribute': (models.Attribute, serializers.AttributeSerializer),
-    'product': (models.Product, serializers.ProductSerializer),
-    'productattributes': (models.ProductAttributes, serializers.ProductAttributesSerializer),
-    'image': (models.Image, serializers.ImageSerializer),
-    'productimage': (models.ProductImage, serializers.ProductImageSerializer),
-    'catalog': (models.Catalog, serializers.CatalogSerializer),
+    'attributename': (models.AttributeName, serializers.AttributeNameSerializer, 0),
+    'attributevalue': (models.AttributeValue, serializers.AttributeValueSerializer, 1),
+    'attribute': (models.Attribute, serializers.AttributeSerializer, 2),
+    'product': (models.Product, serializers.ProductSerializer, 3),
+    'productattributes': (models.ProductAttributes, serializers.ProductAttributesSerializer, 4),
+    'image': (models.Image, serializers.ImageSerializer, 5),
+    'productimage': (models.ProductImage, serializers.ProductImageSerializer, 6),
+    'catalog': (models.Catalog, serializers.CatalogSerializer, 7),  # last one is import order (imports need sorting before they can be applied, with regard to FK)
 }
 
 # curl -i -X POST localhost:8000/import -H "Content-Type: application/json" --data-binary "@zadani/django-assignment/test_data.json"
@@ -34,23 +40,13 @@ class Import(APIView):
         def add_error(msg):
             errors.append(msg)
 
-        '''
-        def is_simple_editable_field(field):
-            return (
-                    field.editable
-                    and not field.primary_key
-                    and not isinstance(field, (ForeignObjectRel, RelatedField))
-            )
+        def model():  # for error reporting only
+            return str(serializer.__class__)[32:-12]  # <class 'product_api.serializers.ProductSerializer'>  ->   Product
 
-        def update_from_dict(instance, attrs):
-            allowed_field_names = {
-                f.name for f in instance._meta.get_fields()
-                if is_simple_editable_field(f)
-            }
-            for attr, val in attrs.items():
-                if attr in allowed_field_names:
-                    setattr(instance, attr, val)
-        '''
+        def log_import():
+            print(10*'-', datetime.now().strftime('%Y.%m.%d %H:%M:%S'), 10*'-', 'inserted: %s, updated %s' % (inserted, updated), 10*'-', 'errors:' if errors else '')
+            for err in errors:
+                print(err)
 
         data = request.data
         if type(data) not in (list, tuple):
@@ -69,7 +65,7 @@ class Import(APIView):
             for key, values in kv:
                 break
 
-            Model, Serializer = ModelSwitch.classes(key)
+            Model, Serializer, import_order = ModelSwitch.classes(key)
             if Model is None:
                 add_error("each item must contain 1 key which must be a known model name, which fails for: item %s, %s" % (i, key))
                 continue
@@ -90,79 +86,83 @@ class Import(APIView):
                     serializer = Serializer(data=values)
                     inserted += 1
                 else:             # id not prepared for update but exists in db
-                    new = row.__dict__.copy()
-                    new.update(**values)
-                    serializer = Serializer(data=new)
-                    updated += 1
-            else:                 # id already prepared from an earlier item in this import
-                new = updates[pos].initial_data.copy()
-                new.update(**values)
-                serializer = Serializer(data=new)
-            #if serializer.is_valid():
-            if pos is None:
+                    serializer = Serializer(row, data=values)   # we will use this for validation, but ...
+                    # ... no idea how to force Update instead of Insert, so lets update using the model-instance
+                    #   which (as everything) is not easy in Django, but see models.py:UpdateMixin
                 index[updates_key] = len(updates)
-                updates.append(serializer)
-            else:
-                updates[pos] = serializer
-            #else:
-            #    err = []
-            #    for k in serializer.errors:
-            #        err.append('%s : %s' % (k, ', '.join(serializer.errors[k])))
-            #    add_error("data aren't valid for: item %s, %s, id %s (%s)" % (i, key, pk, '; '.join(err)))
+                updates.append([serializer, import_order, row])  # row we need for the Update (using Model instead of Serializer) mentioned above
+            else:                 # id already prepared from an earlier item in this import
+                values.update(updates[pos][0].initial_data)
+                updates[pos][0] = Serializer(data=values)
+
+        updates.sort(key=itemgetter(1))  # if we sort models into order based on FK dependencies, we can save the import in some cases (stable sort is good here!)
+        index = None   # not used anymore, but to be sure; because after the Sort is Index invalidated
 
         if not errors:
             failed = False
-            serializer = None
             try:
                 with transaction.atomic():     # This code executes inside a transaction
-                    for serializer in updates:
-                        if serializer.is_valid() and not failed:
-                            try:
-                                serializer.save()
-                            except Exception as exc:
-                                failed = True
-                                msg = "cannot update database (integrity error or so)"
-                                if serializer:
-                                    add_error('%s, %s id %s' % (msg, serializer.__class__, serializer.validated_data['id']))
-                                else:
-                                    add_error(msg)
+                    for serializer, _import_order, row in updates:
+                        if serializer.is_valid():
+                            if not failed:     # we will never update the db more after the 1st error
+                                required_id = serializer.initial_data.get('id')
+                                try:
+                                    if row:   # Update instead of Insert (because I have no idea how to implement such a stupid thing with serializer itself)
+                                        if row.update(**serializer.validated_data):   # see models.py:UpdateMixin
+                                            updated += 1
+                                        instance = row
+                                    else:
+                                        instance = serializer.save()
+                                except Exception as exc:
+                                    # raise exc  # for Debug purposes
+                                    failed = True
+                                    add_error("cannot update database (integrity error,..), %s %s" % (model(), serializer.initial_data))
+                                if not failed and required_id and instance.id != required_id:   # not saved as expected ('if not failed' is necessary, otherwise 'instance' is missing)
+                                    failed = True
+                                    if FAILURE_MODE == FAILURE_STOP:  # we want preserve all previous, but this instance is corrupted
+                                        instance.delete()
+                                    add_error("id order mismatch, different id expected, %s %s but id %s received" % (model(), serializer.initial_data, instance.id))
                         else:
                             failed = True
                             err = []
                             for k in serializer.errors:
                                 err.append('%s : %s' % (k, ', '.join(serializer.errors[k])))
-                            add_error("data aren't valid for: item %s, %s, id %s (%s)" % (i, key, pk, '; '.join(err)))
-                    if failed:
-                        pass  # raise RuntimeError  # break transaction
-            except RuntimeError:
-                pass   # we have errors collected already
+                            add_error("data aren't valid: %s %s (%s)" % (model(), serializer.initial_data, '; '.join(err)))
+                    if FAILURE_MODE == FAILURE_REVERT and failed:
+                        raise RuntimeError  # break+revert transaction
+            except RuntimeError as exc:     # this is just to continue after transaction is reverted
+                inserted = updated = 0
+            except transaction.TransactionManagementError as exc:
+                inserted = updated = 0
+                add_error("+ transaction.TransactionManagementError (more SQL commands after Rollback)")
 
+        results = {'inserted': inserted, 'updated': updated}
         if errors:
-            return Response({'errors': errors}, status=status.HTTP_201_CREATED)  # HTTP_400_BAD_REQUEST
-        else:
-            return Response({'inserted': updated, 'inserted': updated}, status=status.HTTP_201_CREATED)
+            results.update({'errors': errors})
+        log_import()
+        return Response(results, status=status.HTTP_400_BAD_REQUEST if errors and FAILURE_MODE == FAILURE_REVERT else status.HTTP_201_CREATED)
 
-    post = put
+    post = put    # POST: because required in task assignment ; PUT: because of idempotent behaviour
 
 
 # curl -i -X GET localhost:8000/detail/product/ -H "Content-Type: application/json"
 class List(APIView):
     """GET /detail/<tablename>/ : list all rows from the table <tablename>"""
     def get(self, request, model, format=None):
-        Model, Serializer = ModelSwitch.classes(model)
+        Model, Serializer, _import_order = ModelSwitch.classes(model)
         if Model is None:
             return Response(status=status.HTTP_400_BAD_REQUEST)
         rows = Model.objects.all()
         serializer = Serializer(rows, many=True, as_list=True)
         return Response([row['id'] for row in serializer.data])  # returns id's as list; use this if all serializers return id only
-        # return Response(serializer.data)                       # returns list of dict (fields); use this if serializers should return different fields
+        # return Response(serializer.data)                       # returns list of dict (fields); use this if serializers should return different fields (have different list_fields)
 
 
 # curl -i -X GET localhost:8000/detail/product/1 -H "Content-Type: application/json"
 class Detail(APIView):
     """GET /detail/<tablename>/<pk> : list all fields from the table <tablename> at the row with id <pk>"""
     def get(self, request, model, pk, format=None):
-        Model, Serializer = ModelSwitch.classes(model)
+        Model, Serializer, _import_order = ModelSwitch.classes(model)
         if Model is None:
             return Response(status=status.HTTP_400_BAD_REQUEST)
 
